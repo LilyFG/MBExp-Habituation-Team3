@@ -1,0 +1,557 @@
+---
+title: "GAMM analyses"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+date: "2026-04-20"
+---
+
+
+
+```{r,include = FALSE}
+library(dplyr)
+
+df <- read.csv("/Users/yangji/Downloads/osfstorage-archive/final_merged_manybabies.csv", header = TRUE, sep = ",")
+
+# Only variables specified for habituation analyses in the variable dictionary are included.
+
+df=df[df$habituation==TRUE,]
+
+
+```
+
+## Data preparations
+
+In GAMM analyses, several key variables are required. Primarily, the time-series analysis utilizes Y and X derived from the `looking_time` and `trial_number` variables. A new measure, `looking_time2`, was created to incorporate looking time during the freeze-frame period.
+
+The primary focus of this analysis is the experimental conditions. For this MBE, these are nested within `trial_type` and have been divided into three new variables: infant-directedness (`tt_dir`), consistency (`tt_con`), and social context (`tt_soc`). Any null values have been recoded as dummy values.
+
+Interaction variables include `method` and `participant_sex`. To account for developmental trends, we can utilize either the continuous variable `age_days` or the discrete variable `age_group_new`. While `stimulus_id` could be recoded to further investigate specific stimulus types, this is likely unnecessary for the current analysis.
+
+The random effect is accounted for by the `unique_subject_identifier` variable.
+
+*Exclusions:*
+
+- `stimulus_type` was excluded as it contains only one unique value.
+
+- `project_id` and `lab_id` were excluded because they represent higher-level groupings than `trial_type` and `unique_subject_identifier`, respectively.
+
+- Demographic variables are not used, since they are controlled altogether by `unique_subject_identifier`, unless we need to look into these details.
+
+
+<br>
+
+### Overview
+
+```{r}
+names(df)
+```
+
+<br>
+
+#### Y: `looking_time` (numeric)
+
+A supplemental variable, `looking_time2`, was created by incorporating looking time from the MB4 freeze-frame period into the conventional looking time measure.
+
+```{r}
+
+df$looking_time2=0
+df$looking_time2[!is.na(df$lookingtime_freezeframe)]=df$lookingtime_freezeframe[!is.na(df$lookingtime_freezeframe)]
+df$looking_time2=df$looking_time+df$looking_time2
+
+
+```
+
+<br>
+
+#### X: `trial_number` (numeric)
+
+```{r,echo=FALSE}
+
+df$trial_number <- as.numeric(df$trial_number)
+df <- df[df$trial_number <= 12,]
+paste("MB1: ",paste(sort(unique(df$trial_number[df$project_id=="MB1"])),collapse=", "),sep="")
+paste("MB3: ",paste(sort(unique(df$trial_number[df$project_id=="MB3"])),collapse=", "),sep="")
+paste("MB4: ",paste(sort(unique(df$trial_number[df$project_id=="MB4"])),collapse=", "),sep="")
+```
+
+<br>
+
+#### Exp: `trial_type` (ordered, with dummy)
+
+The `trial_type` column contains nested conditions for the MB1, MB3, and MB5 sub-tasks, which required recategorization for analysis. For instance, to examine the infant-directedness aspect of MB1, a new variable, `tt_dir`, was created to distinguish between 'IDS' (Infant-Directed Speech) and 'ADS' (Adult-Directed Speech). Observations from MB3 and MB5, which did not involve these conditions, were assigned `NA` values.
+
+*Exclusions*: The higher-level variable `project_id` was no longer required.
+
+```{r}
+unique(df$trial_type)
+```
+
+```{r,include = FALSE}
+df$tt_con <- ifelse(df$trial_type %in% c("consistent","inconsistent"),
+                    df$trial_type, NA)
+df <- df %>%
+  mutate(tt_con = case_when(
+    is.na(tt_con) ~ 0,
+    tt_con == "consistent" ~ 1,
+    tt_con == "inconsistent" ~ 2
+  ))
+
+df$tt_soc <- ifelse(df$trial_type %in% c("nonsocial","social"), 
+                    df$trial_type, NA)
+df <- df %>%
+  mutate(tt_soc = case_when(
+    is.na(tt_soc) ~ 0,
+    tt_soc == "social" ~ 1,
+    tt_soc == "nonsocial" ~ 2
+  ))
+
+df$tt_dir <- ifelse(df$trial_type %in% c("IDS","ADS"), 
+                    df$trial_type, NA)
+df <- df %>%
+  mutate(tt_dir = case_when(
+    is.na(tt_dir) ~ 0,
+    tt_dir == "IDS" ~ 1,
+    tt_dir == "ADS" ~ 2
+  ))
+
+df$tt_dir=as.ordered(df$tt_dir)
+df$tt_con=as.ordered(df$tt_con)
+df$tt_soc=as.ordered(df$tt_soc)
+```
+
+To facilitate contrast analyses with GAMM, these categories were converted into ordered variables where NA is coded as 0, the target conditions (e.g., IDS/consistent/social) as 1, and the alternative conditions (e.g., ADS/inconsistent/nonsocial) as 2.
+
+```{r}
+unique(df$tt_dir) # NA = 0, IDS = 1, ADS = 2
+unique(df$tt_con) # NA = 0, consistent = 1, inconsistent = 2
+unique(df$tt_soc) # NA = 0, social = 1, nonsocial = 2
+```
+
+<br>
+
+#### Additional Exp:
+
+```{r}
+# As a "by" factor:
+df$method <- as.factor(df$unique_subject_identifier)
+df$participant_sex <- as.factor(df$participant_sex)
+```
+
+```{r}
+# Exclusion: only if we would like to look into detailed stimulus types:
+df$stimulus_id <- as.factor(df$stimulus_id)
+```
+
+```{r}
+# Developmental factors:
+df$age_days <- as.numeric(df$age_days)
+df$age_group_new <- as.factor(df$age_group_new)
+```
+
+
+#### Random Var: `unique_subject_identifier` (factor)
+
+*Exclusions*: The higher-level variable `lab_id` was no longer required.
+
+```{r}
+df$unique_subject_identifier <- as.factor(df$unique_subject_identifier)
+```
+
+<br>
+
+### GAMM
+
+```{r,include=FALSE}
+library(mgcv)
+library(itsadug)
+```
+
+
+```{r}
+# Subset data for GAMM analyses
+sub_df <- df[, c(
+  # Y
+  "looking_time",
+  "looking_time2",
+  # X
+  "trial_number",
+  # Exp
+  "tt_dir", # MB1
+  "tt_con", # MB3
+  "tt_soc", # MB4
+  # By
+  "method",
+  "participant_sex",
+  # Dev
+  "age_days",
+  "age_group_new",
+  #random
+  "unique_subject_identifier"
+  )]
+
+# Sort data per individual trajectory
+sub_df = sub_df[order(sub_df$unique_subject_identifier,sub_df$trial_number),]
+
+# Mark the start of each trajectory (for ACF purposes)
+sub_df$start.event <- sub_df$trial_number == 1
+
+# Rename variables
+names(sub_df) = c("y1","y2","x","dir","con","soc","method","gender","days","agegrp","id","start.event")
+
+```
+
+Still need hime hpc to run *echt GAMM*, but for the time being, use simple random effects `s(id, bs = "re")`. 
+
+Autocorrelation not yet corrected!
+
+#### Overall habituation trend
+
+```{r}
+setwd("/Users/yangji/Downloads/osfstorage-archive")
+# m0 <- bam(y1 ~ s(x) + s(id, bs = "re"),
+#              data = sub_df,
+#              method = "fREML",
+#              discrete = TRUE)
+# saveRDS(m0, file="m0.rds")
+
+m0 = readRDS("m0.rds")
+
+rho0 = acf_resid(m0)[2] # no correction 
+
+par(mfrow=c(1,2), cex=1.1)
+
+plot_smooth(m0, view="x",
+            xlim = c(1,12),
+            xlab="Trial",ylab="LT (s)",
+            rm.ranef=FALSE, main="Intercept + s(Trial) + RE", rug=TRUE,
+            col='gray')
+
+plot_smooth(m0, view="x",
+            xlim = c(1,12),
+            xlab="Trial",ylab="LT (s)",
+            rm.ranef=TRUE, main="Intercept + s(Trial)", rug=TRUE,
+            col='gray')
+```
+
+```{r}
+# contrasts(sub_df$dir) <- 'contr.treatment'
+# m1.1 <- bam(y1 ~ s(x) + dir + s(x, by = dir) + s(id, bs = "re"),
+#             data = sub_df,
+#             method = "fREML",
+#             discrete = TRUE)
+# saveRDS(m1.1, file="m1.1.rds")
+
+
+m1.1 = readRDS("m1.1.rds")
+
+rho0 = acf_resid(m1.1)[2] # no correction 
+
+summary(m1.1)
+
+# par(mfrow=c(2,2), cex=1.1)
+
+plot_smooth(m1.1, view="x",cond=list(dir=0), 
+            xlim = c(1,12),ylim = c(0,15),
+            xlab="Trial",ylab="LT (s)",
+            rm.ranef=TRUE, main="Intercept + s(Trial)", 
+            col='gray') ## 0 = NA
+
+plot_smooth(m1.1, view="x", cond=list(dir=1), 
+            add=TRUE, col='green') ## 1 = IDS
+plot_smooth(m1.1, view="x", cond=list(dir=2), 
+            add=TRUE, col='red') ## 2 = ADS
+
+plot_diff(m1.1, view="x", 
+          comp=list(dir=c(1, 0)),
+          # ylim = c(0,8),
+          main="IDS - Baseline",
+          col=c('blue','gray'), 
+          ylab="Est. difference in LT (s)",
+          rm.ranef=TRUE,sim.ci=TRUE)
+
+plot_diff(m1.1, view="x", 
+          comp=list(dir=c(2, 0)),
+          # ylim = c(0,8),
+          main="ADS - Baseline",
+          col=c('blue','gray'),
+          ylab="Est. difference in LT (s)",
+          rm.ranef=TRUE,sim.ci=TRUE)
+
+plot_diff(m1.1, view="x", 
+          comp=list(dir=c(1, 2)),
+          # ylim = c(0,8),
+          main="IDS - ADS",
+          col=c('blue','red'), 
+          ylab="Est. difference in LT (s)",
+          rm.ranef=TRUE,sim.ci=TRUE)
+
+```
+
+
+
+```{r}
+# contrasts(sub_df$con) <- 'contr.treatment'
+# m1.2 <- bam(y1 ~ s(x) + con + s(x, by = con) + s(id, bs = "re"),
+#             data = sub_df,
+#             method = "fREML",
+#             discrete = TRUE)
+# saveRDS(m1.2, file="m1.2.rds")
+
+m1.2 = readRDS("m1.2.rds")
+
+rho0 = acf_resid(m1.2)[2] # no correction 
+
+summary(m1.2)
+
+# par(mfrow=c(2,2), cex=1.1)
+
+plot_smooth(m1.2, view="x",cond=list(con=0), 
+            xlim = c(1,12),ylim = c(0,15),
+            xlab="Trial",ylab="LT (s)",
+            rm.ranef=TRUE, main="Intercept + s(Trial)", 
+            col='gray') ## 0 = NA
+
+plot_smooth(m1.2, view="x", cond=list(con=1), 
+            add=TRUE, col='green') ## 1 = con
+plot_smooth(m1.2, view="x", cond=list(con=2), 
+            add=TRUE, col='red') ## 2 = incon
+
+plot_diff(m1.2, view="x", 
+          comp=list(con=c(1, 0)),
+          # ylim = c(0,8),
+          main="Consistent - Baseline",
+          col=c('blue','gray'), 
+          ylab="Est. difference in LT (s)",
+          rm.ranef=TRUE,sim.ci=TRUE)
+
+plot_diff(m1.2, view="x", 
+          comp=list(con=c(2, 0)),
+          # ylim = c(0,8),
+          main="Inconsistent - Baseline",
+          col=c('blue','gray'),
+          ylab="Est. difference in LT (s)",
+          rm.ranef=TRUE,sim.ci=TRUE)
+
+plot_diff(m1.2, view="x", 
+          comp=list(con=c(1, 2)),
+          # ylim = c(0,8),
+          main="Consistent - Inconsistent",
+          col=c('blue','red'), 
+          ylab="Est. difference in LT (s)",
+          rm.ranef=TRUE,sim.ci=TRUE)
+```
+
+```{r}
+# contrasts(sub_df$soc) <- 'contr.treatment'
+# m1.3 <- bam(y1 ~ s(x) + soc + s(x, by = soc) + s(id, bs = "re"),
+#             data = sub_df,
+#             method = "fREML",
+#             discrete = TRUE)
+# saveRDS(m1.3, file="m1.3.rds")
+
+m1.3 = readRDS("m1.3.rds")
+
+rho0 = acf_resid(m1.3)[2] # no correction 
+
+summary(m1.3)
+
+# par(mfrow=c(2,2), cex=1.1)
+
+plot_smooth(m1.3, view="x",cond=list(soc=0), 
+            xlim = c(1,12),ylim = c(0,15),
+            xlab="Trial",ylab="LT (s)",
+            rm.ranef=TRUE, main="Intercept + s(Trial)",
+            col='gray') ## 0 = NA
+
+plot_smooth(m1.3, view="x", cond=list(soc=1), 
+            add=TRUE, col='green') ## 1 = social
+plot_smooth(m1.3, view="x", cond=list(soc=2), 
+            add=TRUE, col='red') ## 2 = nonsocial
+
+plot_diff(m1.3, view="x", 
+          comp=list(soc=c(1, 0)),
+          # ylim = c(0,8),
+          main="Social - Baseline",
+          col=c('blue','gray'), 
+          ylab="Est. difference in LT (s)",
+          rm.ranef=TRUE,sim.ci=TRUE)
+
+plot_diff(m1.3, view="x", 
+          comp=list(soc=c(2, 0)),
+          # ylim = c(0,8),
+          main="Nonsocial - Baseline",
+          col=c('blue','gray'),
+          ylab="Est. difference in LT (s)",
+          rm.ranef=TRUE,sim.ci=TRUE)
+
+plot_diff(m1.3, view="x", 
+          comp=list(soc=c(1, 2)),
+          # ylim = c(0,8),
+          main="Social - Non-social",
+          col=c('blue','red'), 
+          ylab="Est. difference in LT (s)",
+          rm.ranef=TRUE,sim.ci=TRUE)
+
+```
+
+#### Interactions (tensor est `te` only performed using *HPC*)
+
+##### By method interactions
+
+###### Differential trends across distinct methods
+
+```{r}
+
+# contrasts(sub_df$method) <- 'contr.treatment'
+# 
+# m2.1 <- bam(y1 ~ te(x, days, by = method) + method + s(id, bs = "re"),
+#             data = sub_df,
+#             method = "fREML",
+#             discrete = TRUE,
+#             trace = TRUE)
+# saveRDS(m2.1, file="m2.1.rds")
+
+# m2.1=readRDS("m2.1.rds")
+# 
+# summary(m2.1)
+# plot_diff2(m2.1, view = c("x","method"))
+
+```
+
+###### Trends of various methods across directedness levels
+
+```{r}
+
+# sub_df$dir.m = interaction(sub_df$dir,sub_df$method)
+# sub_df$dir.m = as.factor(sub_df$dir.m)
+# 
+# contrasts(sub_df$dir.m) <- 'contr.treatment'
+# 
+# m2.2 <- bam(y1 ~ te(x, days, by = dir.m) + dir.m + s(id, bs = "re"),
+#             data = sub_df,
+#             method = "fREML",
+#             discrete = TRUE)
+# saveRDS(m2.2, file="m2.2.rds")
+
+# m2.2=readRDS("m2.2.rds")
+
+```
+
+###### Trends of various methods across consistency.
+
+```{r}
+
+# sub_df$con.m = interaction(sub_df$con,sub_df$method)
+# sub_df$con.m = as.factor(sub_df$con.m)
+# 
+# contrasts(sub_df$con.m) <- 'contr.treatment'
+# 
+# m2.3 <- bam(y1 ~ te(x, days, by = con.m) + con.m + s(id, bs = "re"),
+#             data = sub_df,
+#             method = "fREML",
+#             discrete = TRUE)
+# saveRDS(m2.3, file="m2.3.rds")
+
+# m2.3=readRDS("m2.3.rds")
+
+```
+
+###### Trends of various methods across levels of social interaction.
+
+```{r}
+
+# sub_df$soc.m = interaction(sub_df$soc,sub_df$method)
+# sub_df$soc.m = as.factor(sub_df$soc.m)
+# 
+# contrasts(sub_df$soc.m) <- 'contr.treatment'
+# 
+# m2.4 <- bam(y1 ~ te(x, days, by = soc.m) + soc.m + s(id, bs = "re"),
+#             data = sub_df,
+#             method = "fREML",
+#             discrete = TRUE)
+# saveRDS(m2.4, file="m2.4.rds")
+
+# m2.4=readRDS("m2.4.rds")
+
+```
+
+
+##### By gender interactions
+
+###### Differential trends across genders
+
+```{r}
+
+# contrasts(sub_df$method) <- 'contr.treatment'
+# 
+# m3.1 <- bam(y1 ~ te(x, days, by = gender) + gender + s(id, bs = "re"),
+#             data = sub_df,
+#             method = "fREML",
+#             discrete = TRUE,
+#             nthreads = 8)
+# saveRDS(m3.1, file="m3.1.rds")
+
+# m3.1=readRDS("m3.1.rds")
+
+```
+
+###### Trends of genders across directedness levels
+
+```{r}
+
+# sub_df$dir.m = interaction(sub_df$dir,sub_df$gender)
+# sub_df$dir.m = as.factor(sub_df$dir.m)
+# 
+# contrasts(sub_df$dir.m) <- 'contr.treatment'
+# 
+# m3.2 <- bam(y1 ~ te(x, days, by = dir.m) + dir.m + s(id, bs = "re"),
+#             data = sub_df,
+#             method = "fREML",
+#             discrete = TRUE)
+# saveRDS(m3.2, file="m3.2.rds")
+
+# m3.2=readRDS("m3.2.rds")
+
+```
+
+###### Trends of genders across consistency.
+
+```{r}
+
+# sub_df$con.m = interaction(sub_df$con,sub_df$gender)
+# sub_df$con.m = as.factor(sub_df$con.m)
+# 
+# contrasts(sub_df$con.m) <- 'contr.treatment'
+# 
+# m3.3 <- bam(y1 ~ te(x, days, by = con.m) + con.m + s(id, bs = "re"),
+#             data = sub_df,
+#             method = "fREML",
+#             discrete = TRUE)
+# saveRDS(m3.3, file="m3.3.rds")
+
+# m3.3=readRDS("m3.3.rds")
+
+```
+
+###### Trends of genders across levels of social interaction.
+
+```{r}
+
+# sub_df$soc.m = interaction(sub_df$soc,sub_df$gender)
+# sub_df$soc.m = as.factor(sub_df$soc.m)
+# 
+# contrasts(sub_df$soc.m) <- 'contr.treatment'
+# 
+# m3.4 <- bam(y1 ~ te(x, days, by = soc.m) + soc.m + s(id, bs = "re"),
+#             data = sub_df,
+#             method = "fREML",
+#             discrete = TRUE)
+# saveRDS(m3.4, file="m3.4.rds")
+
+# m3.4=readRDS("m3.4.rds")
+
+```
+
+
